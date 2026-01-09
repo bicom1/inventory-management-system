@@ -430,12 +430,38 @@ $whereClause = implode(" AND ", $where);
 // Get categories for filter
 $categories = $conn->query("SELECT * FROM categories ORDER BY name")->fetch_all(MYSQLI_ASSOC);
 
-// Get inventory items
-$query = "SELECT i.*, c.name as category_name FROM inventory i LEFT JOIN categories c ON i.category_id = c.id WHERE $whereClause ORDER BY i.created_at DESC";
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
+// Get total count for pagination
+$countQuery = "SELECT COUNT(*) as total FROM inventory i LEFT JOIN categories c ON i.category_id = c.id WHERE $whereClause";
+$countStmt = $conn->prepare($countQuery);
+if (!empty($params)) {
+    $countStmt->bind_param($types, ...$params);
+}
+$countStmt->execute();
+$countResult = $countStmt->get_result();
+$totalItems = $countResult->fetch_assoc()['total'];
+$countStmt->close();
+$totalPages = max(1, ceil($totalItems / $limit));
+
+// Get inventory items with pagination
+$query = "SELECT i.*, c.name as category_name FROM inventory i LEFT JOIN categories c ON i.category_id = c.id WHERE $whereClause ORDER BY i.created_at DESC LIMIT ? OFFSET ?";
 $stmt = $conn->prepare($query);
 
+// Add LIMIT and OFFSET parameters
+$limitParam = $limit;
+$offsetParam = $offset;
 if (!empty($params)) {
+    $types .= "ii"; // Add types for LIMIT and OFFSET
+    $params[] = $limitParam;
+    $params[] = $offsetParam;
     $stmt->bind_param($types, ...$params);
+} else {
+    $stmt->bind_param("ii", $limitParam, $offsetParam);
 }
 
 $stmt->execute();
@@ -577,6 +603,25 @@ if ($message) {
                 </tbody>
             </table>
         </div>
+        <?php if ($totalPages > 1): ?>
+            <div class="card-footer">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <small class="text-muted">
+                            Showing <?php echo count($items); ?> of <?php echo $totalItems; ?> items (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                        </small>
+                    </div>
+                    <?php 
+                    echo renderPagination($page, $totalPages, 'inventory.php', [
+                        'search' => $search,
+                        'category' => $categoryFilter > 0 ? $categoryFilter : '',
+                        'type' => $typeFilter,
+                        'status' => $statusFilter
+                    ]);
+                    ?>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 

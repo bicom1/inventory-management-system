@@ -161,8 +161,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Get purchase categories
-$categories = $conn->query("SELECT pc.*, COUNT(p.id) as purchase_count FROM purchase_categories pc LEFT JOIN purchases p ON pc.id = p.purchase_category_id GROUP BY pc.id ORDER BY pc.name")->fetch_all(MYSQLI_ASSOC);
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
+// Get total count for pagination
+$totalCategories = $conn->query("SELECT COUNT(*) as total FROM purchase_categories")->fetch_assoc()['total'];
+$totalPages = max(1, ceil($totalCategories / $limit));
+
+// Get purchase categories with pagination
+$categories = $conn->query("SELECT pc.*, COUNT(p.id) as purchase_count FROM purchase_categories pc LEFT JOIN purchases p ON pc.id = p.purchase_category_id GROUP BY pc.id ORDER BY pc.name LIMIT $limit OFFSET $offset")->fetch_all(MYSQLI_ASSOC);
 ?>
 
 <div class="row mb-4">
@@ -233,6 +243,18 @@ if ($message) {
                 </tbody>
             </table>
         </div>
+        <?php if ($totalPages > 1): ?>
+            <div class="card-footer">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <small class="text-muted">
+                            Showing <?php echo count($categories); ?> of <?php echo $totalCategories; ?> purchase categories (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                        </small>
+                    </div>
+                    <?php echo renderPagination($page, $totalPages, 'purchase_categories.php'); ?>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 

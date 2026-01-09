@@ -66,8 +66,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 $stmt->close();
                 
+                // Ensure all variables are properly typed before binding
+                $name = (string)($name ?? '');
+                $title = (string)($title ?? '');
+                $description = (string)($description ?? '');
+                $purchaseCategoryId = (int)($purchaseCategoryId ?? 0);
+                $purchaseDate = (string)($purchaseDate ?? date('Y-m-d'));
+                $expiryDate = (string)($expiryDate ?? '');
+                $quantity = (int)($quantity ?? 1);
+                $unitPrice = (float)($unitPrice ?? 0);
+                $totalAmount = (float)($totalAmount ?? 0);
+                $supplier = (string)($supplier ?? '');
+                $invoiceNumber = (string)($invoiceNumber ?? '');
+                $status = (string)($status ?? 'active');
+                $notes = (string)($notes ?? '');
+                $id = (int)($id ?? 0);
+                
+                // Prepare UPDATE statement - 14 placeholders
                 $stmt = $conn->prepare("UPDATE purchases SET name = ?, title = ?, description = ?, purchase_category_id = ?, purchase_date = ?, expiry_date = ?, quantity = ?, unit_price = ?, total_amount = ?, supplier = ?, invoice_number = ?, status = ?, notes = ? WHERE id = ?");
-                $stmt->bind_param("sssisiddssssi", $name, $title, $description, $purchaseCategoryId, $purchaseDate, $expiryDate, $quantity, $unitPrice, $totalAmount, $supplier, $invoiceNumber, $status, $notes, $id);
+                
+                // Bind parameters: 14 parameters total
+                // Type string: s=string, i=integer, d=double
+                // Order: name(s), title(s), description(s), purchase_category_id(i), purchase_date(s), expiry_date(s), quantity(i), unit_price(d), total_amount(d), supplier(s), invoice_number(s), status(s), notes(s), id(i)
+                $paramTypes = "s";  // name
+                $paramTypes .= "s"; // title
+                $paramTypes .= "s"; // description
+                $paramTypes .= "i"; // purchase_category_id
+                $paramTypes .= "s"; // purchase_date
+                $paramTypes .= "s"; // expiry_date
+                $paramTypes .= "i"; // quantity
+                $paramTypes .= "d"; // unit_price
+                $paramTypes .= "d"; // total_amount
+                $paramTypes .= "s"; // supplier
+                $paramTypes .= "s"; // invoice_number
+                $paramTypes .= "s"; // status
+                $paramTypes .= "s"; // notes
+                $paramTypes .= "i"; // id
+                // $paramTypes = "sssisiddssssi" (14 characters)
+                
+                $stmt->bind_param($paramTypes, $name, $title, $description, $purchaseCategoryId, $purchaseDate, $expiryDate, $quantity, $unitPrice, $totalAmount, $supplier, $invoiceNumber, $status, $notes, $id);
                 
                 if ($stmt->execute()) {
                     $newValues = ['name' => $name, 'total_amount' => $totalAmount, 'status' => $status];
@@ -157,20 +194,50 @@ if (!empty($dateTo)) {
 
 $whereClause = implode(" AND ", $where);
 
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
 // Get purchase categories for filter
 $purchaseCategories = $conn->query("SELECT * FROM purchase_categories ORDER BY name")->fetch_all(MYSQLI_ASSOC);
 
-// Get purchases
+// Get total count for pagination
+$countQuery = "SELECT COUNT(*) as total 
+          FROM purchases p 
+          LEFT JOIN purchase_categories pc ON p.purchase_category_id = pc.id
+          LEFT JOIN users u ON p.created_by = u.id
+          WHERE $whereClause";
+$countStmt = $conn->prepare($countQuery);
+if (!empty($params)) {
+    $countStmt->bind_param($types, ...$params);
+}
+$countStmt->execute();
+$countResult = $countStmt->get_result();
+$totalPurchases = $countResult->fetch_assoc()['total'];
+$countStmt->close();
+$totalPages = max(1, ceil($totalPurchases / $limit));
+
+// Get purchases with pagination
 $query = "SELECT p.*, pc.name as category_name, u.full_name as created_by_name 
           FROM purchases p 
           LEFT JOIN purchase_categories pc ON p.purchase_category_id = pc.id
           LEFT JOIN users u ON p.created_by = u.id
           WHERE $whereClause 
-          ORDER BY p.purchase_date DESC, p.created_at DESC";
+          ORDER BY p.purchase_date DESC, p.created_at DESC
+          LIMIT ? OFFSET ?";
 $stmt = $conn->prepare($query);
 
+$limitParam = $limit;
+$offsetParam = $offset;
 if (!empty($params)) {
+    $types .= "ii";
+    $params[] = $limitParam;
+    $params[] = $offsetParam;
     $stmt->bind_param($types, ...$params);
+} else {
+    $stmt->bind_param("ii", $limitParam, $offsetParam);
 }
 
 $stmt->execute();
@@ -303,6 +370,26 @@ if ($message) {
                 </tbody>
             </table>
         </div>
+        <?php if ($totalPages > 1): ?>
+            <div class="card-footer">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <small class="text-muted">
+                            Showing <?php echo count($purchases); ?> of <?php echo $totalPurchases; ?> purchases (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                        </small>
+                    </div>
+                    <?php 
+                    echo renderPagination($page, $totalPages, 'purchases.php', [
+                        'search' => $search,
+                        'category' => $categoryFilter > 0 ? $categoryFilter : '',
+                        'status' => $statusFilter,
+                        'date_from' => $dateFrom,
+                        'date_to' => $dateTo
+                    ]);
+                    ?>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 

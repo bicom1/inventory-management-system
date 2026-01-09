@@ -59,17 +59,45 @@ $whereClause = implode(" AND ", $where);
 $actions = $conn->query("SELECT DISTINCT action FROM audit_logs ORDER BY action")->fetch_all(MYSQLI_ASSOC);
 $tables = $conn->query("SELECT DISTINCT table_name FROM audit_logs WHERE table_name IS NOT NULL ORDER BY table_name")->fetch_all(MYSQLI_ASSOC);
 
-// Get audit logs
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
+// Get total count for pagination
+$countQuery = "SELECT COUNT(*) as total 
+          FROM audit_logs al
+          LEFT JOIN users u ON al.user_id = u.id
+          WHERE $whereClause";
+$countStmt = $conn->prepare($countQuery);
+if (!empty($params)) {
+    $countStmt->bind_param($types, ...$params);
+}
+$countStmt->execute();
+$countResult = $countStmt->get_result();
+$totalLogs = $countResult->fetch_assoc()['total'];
+$countStmt->close();
+$totalPages = max(1, ceil($totalLogs / $limit));
+
+// Get audit logs with pagination
 $query = "SELECT al.*, u.username, u.full_name 
           FROM audit_logs al
           LEFT JOIN users u ON al.user_id = u.id
           WHERE $whereClause
           ORDER BY al.created_at DESC
-          LIMIT 500";
+          LIMIT ? OFFSET ?";
 $stmt = $conn->prepare($query);
 
+$limitParam = $limit;
+$offsetParam = $offset;
 if (!empty($params)) {
+    $types .= "ii";
+    $params[] = $limitParam;
+    $params[] = $offsetParam;
     $stmt->bind_param($types, ...$params);
+} else {
+    $stmt->bind_param("ii", $limitParam, $offsetParam);
 }
 
 $stmt->execute();
@@ -169,6 +197,26 @@ $stmt->close();
                 </tbody>
             </table>
         </div>
+        <?php if ($totalPages > 1): ?>
+            <div class="card-footer">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <small class="text-muted">
+                            Showing <?php echo count($logs); ?> of <?php echo $totalLogs; ?> audit logs (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                        </small>
+                    </div>
+                    <?php 
+                    echo renderPagination($page, $totalPages, 'audit_logs.php', [
+                        'search' => $search,
+                        'action' => $actionFilter,
+                        'table' => $tableFilter,
+                        'date_from' => $dateFrom,
+                        'date_to' => $dateTo
+                    ]);
+                    ?>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 

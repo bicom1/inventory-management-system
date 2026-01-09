@@ -449,3 +449,85 @@ function processApprovedRequest($approval) {
     }
 }
 
+/**
+ * Get pagination parameters
+ */
+function getPaginationParams($itemsPerPage = 10) {
+    $page = max(1, intval($_GET['page'] ?? 1));
+    $offset = ($page - 1) * $itemsPerPage;
+    return ['page' => $page, 'offset' => $offset, 'limit' => $itemsPerPage];
+}
+
+/**
+ * Render pagination controls
+ */
+function renderPagination($currentPage, $totalPages, $baseUrl, $additionalParams = []) {
+    if ($totalPages <= 1) {
+        return '';
+    }
+    
+    // Build query string for additional parameters
+    $queryString = '';
+    if (!empty($additionalParams)) {
+        $queryParts = [];
+        foreach ($additionalParams as $key => $value) {
+            if ($value !== '' && $value !== null) {
+                $queryParts[] = urlencode($key) . '=' . urlencode($value);
+            }
+        }
+        if (!empty($queryParts)) {
+            $queryString = '&' . implode('&', $queryParts);
+        }
+    }
+    
+    $html = '<nav aria-label="Page navigation">';
+    $html .= '<ul class="pagination justify-content-center">';
+    
+    // Previous button
+    if ($currentPage > 1) {
+        $prevPage = $currentPage - 1;
+        $html .= '<li class="page-item"><a class="page-link" href="' . $baseUrl . '?page=' . $prevPage . $queryString . '">Previous</a></li>';
+    } else {
+        $html .= '<li class="page-item disabled"><span class="page-link">Previous</span></li>';
+    }
+    
+    // Page numbers
+    $startPage = max(1, $currentPage - 2);
+    $endPage = min($totalPages, $currentPage + 2);
+    
+    if ($startPage > 1) {
+        $html .= '<li class="page-item"><a class="page-link" href="' . $baseUrl . '?page=1' . $queryString . '">1</a></li>';
+        if ($startPage > 2) {
+            $html .= '<li class="page-item disabled"><span class="page-link">...</span></li>';
+        }
+    }
+    
+    for ($i = $startPage; $i <= $endPage; $i++) {
+        if ($i == $currentPage) {
+            $html .= '<li class="page-item active"><span class="page-link">' . $i . '</span></li>';
+        } else {
+            $html .= '<li class="page-item"><a class="page-link" href="' . $baseUrl . '?page=' . $i . $queryString . '">' . $i . '</a></li>';
+        }
+    }
+    
+    if ($endPage < $totalPages) {
+        if ($endPage < $totalPages - 1) {
+            $html .= '<li class="page-item disabled"><span class="page-link">...</span></li>';
+        }
+        $html .= '<li class="page-item"><a class="page-link" href="' . $baseUrl . '?page=' . $totalPages . $queryString . '">' . $totalPages . '</a></li>';
+    }
+    
+    // Next button
+    if ($currentPage < $totalPages) {
+        $nextPage = $currentPage + 1;
+        $html .= '<li class="page-item"><a class="page-link" href="' . $baseUrl . '?page=' . $nextPage . $queryString . '">Next</a></li>';
+    } else {
+        $html .= '<li class="page-item disabled"><span class="page-link">Next</span></li>';
+    }
+    
+    $html .= '</ul>';
+    $html .= '</nav>';
+    
+    return $html;
+}
+

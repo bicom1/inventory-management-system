@@ -33,12 +33,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Get pending approvals
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
+// Get total count for pagination
+$totalApprovals = $conn->query("SELECT COUNT(*) as total FROM approvals WHERE status = 'pending'")->fetch_assoc()['total'];
+$totalPages = max(1, ceil($totalApprovals / $limit));
+
+// Get pending approvals with pagination
 $query = "SELECT a.*, u.full_name as requested_by_name, u.username as requested_by_username
           FROM approvals a
           INNER JOIN users u ON a.requested_by = u.id
           WHERE a.status = 'pending'
-          ORDER BY a.created_at ASC";
+          ORDER BY a.created_at ASC
+          LIMIT $limit OFFSET $offset";
 $result = $conn->query($query);
 $pendingApprovals = $result->fetch_all(MYSQLI_ASSOC);
 ?>
@@ -129,6 +140,18 @@ if ($message) {
                     </tbody>
                 </table>
             </div>
+            <?php if ($totalPages > 1): ?>
+                <div class="card-footer">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <small class="text-muted">
+                                Showing <?php echo count($pendingApprovals); ?> of <?php echo $totalApprovals; ?> pending approvals (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                            </small>
+                        </div>
+                        <?php echo renderPagination($page, $totalPages, 'approvals.php'); ?>
+                    </div>
+                </div>
+            <?php endif; ?>
         <?php else: ?>
             <div class="text-center py-5">
                 <i class="bi bi-check-circle text-success" style="font-size: 4rem;"></i>

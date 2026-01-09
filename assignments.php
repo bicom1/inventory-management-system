@@ -287,6 +287,220 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $messageType = 'danger';
             }
         }
+    } elseif ($action === 'edit') {
+        $assignmentId = intval($_POST['assignment_id'] ?? 0);
+        $employeeId = intval($_POST['employee_id'] ?? 0);
+        $assignedDate = sanitizeInput($_POST['assigned_date'] ?? date('Y-m-d'));
+        $expectedReturnDate = sanitizeInput($_POST['expected_return_date'] ?? '');
+        $notes = sanitizeInput($_POST['notes'] ?? '');
+        $password = sanitizeInput($_POST['password'] ?? '');
+
+        // Arrays of items
+        $inventoryIds = $_POST['inventory_id'] ?? [];
+        $quantities = $_POST['quantity'] ?? [];
+        $conditions = $_POST['condition_on_assignment'] ?? [];
+        $assignmentItemIds = $_POST['assignment_item_id'] ?? []; // Existing item IDs
+
+        if (!is_array($inventoryIds)) {
+            $inventoryIds = [$inventoryIds];
+        }
+        if (!is_array($quantities)) {
+            $quantities = [$quantities];
+        }
+        if (!is_array($conditions)) {
+            $conditions = [$conditions];
+        }
+        if (!is_array($assignmentItemIds)) {
+            $assignmentItemIds = [$assignmentItemIds];
+        }
+
+        $itemsToUpdate = [];
+        $itemsCount = count($inventoryIds);
+
+        for ($i = 0; $i < $itemsCount; $i++) {
+            $itemId = !empty($assignmentItemIds[$i]) ? intval($assignmentItemIds[$i]) : 0;
+            $invId = intval($inventoryIds[$i] ?? 0);
+            $qty = intval($quantities[$i] ?? 0);
+            $cond = sanitizeInput($conditions[$i] ?? 'good');
+
+            if ($invId > 0 && $qty > 0) {
+                $itemsToUpdate[] = [
+                    'assignment_item_id' => $itemId,
+                    'inventory_id' => $invId,
+                    'quantity' => $qty,
+                    'condition' => $cond,
+                ];
+            }
+        }
+
+        if ($assignmentId <= 0 || $employeeId <= 0 || empty($itemsToUpdate)) {
+            $message = 'Please provide valid assignment ID, employee, and at least one item.';
+            $messageType = 'danger';
+        } else {
+            // Start transaction
+            $conn->begin_transaction();
+            
+            try {
+                // Get current assignment items to calculate stock differences
+                $stmt = $conn->prepare("
+                    SELECT ai.id, ai.inventory_id, ai.quantity
+                    FROM assignment_items ai
+                    WHERE ai.assignment_id = ?
+                ");
+                $stmt->bind_param("i", $assignmentId);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                $currentItems = $result->fetch_all(MYSQLI_ASSOC);
+                $stmt->close();
+
+                // Validate all new items and check stock availability
+                foreach ($itemsToUpdate as $item) {
+                    $inventoryId = $item['inventory_id'];
+                    $quantity = $item['quantity'];
+                    $assignmentItemId = $item['assignment_item_id'];
+
+                    // Get current quantity and inventory_id for this assignment_item if it's an update
+                    $currentQty = 0;
+                    $oldInventoryId = null;
+                    if ($assignmentItemId > 0) {
+                        foreach ($currentItems as $currentItem) {
+                            if ($currentItem['id'] == $assignmentItemId) {
+                                $currentQty = $currentItem['quantity'];
+                                $oldInventoryId = $currentItem['inventory_id'];
+                                break;
+                            }
+                        }
+                    }
+
+                    // Check available stock (need to account for current assignment)
+                    $stmt = $conn->prepare("SELECT available_quantity, assigned_quantity, item_name FROM inventory WHERE id = ? FOR UPDATE");
+                    $stmt->bind_param("i", $inventoryId);
+                    $stmt->execute();
+                    $result = $stmt->get_result();
+                    
+                    if ($result->num_rows === 0) {
+                        throw new Exception('Inventory item not found (ID: ' . $inventoryId . ').');
+                    }
+                    
+                    $inventory = $result->fetch_assoc();
+                    $stmt->close();
+                    
+                    // Calculate available stock:
+                    // If updating the same inventory item, add back the current quantity
+                    // If changing to a different inventory item, use current available (old item will be handled separately)
+                    $availableForNew = $inventory['available_quantity'];
+                    if ($oldInventoryId == $inventoryId && $assignmentItemId > 0) {
+                        // Same item, add back current quantity
+                        $availableForNew += $currentQty;
+                    }
+                    
+                    if ($availableForNew < $quantity) {
+                        throw new Exception('Insufficient stock for ' . $inventory['item_name'] . '. Available: ' . $availableForNew . ', requested: ' . $quantity);
+                    }
+                }
+
+                // Update assignment record
+                $stmt = $conn->prepare("UPDATE assignments SET employee_id = ?, assigned_date = ?, expected_return_date = ?, notes = ?, password = ? WHERE id = ?");
+                $stmt->bind_param("issssi", $employeeId, $assignedDate, $expectedReturnDate, $notes, $password, $assignmentId);
+                
+                if (!$stmt->execute()) {
+                    throw new Exception('Error updating assignment: ' . $conn->error);
+                }
+                $stmt->close();
+
+                // Get list of current assignment_item IDs to know what to delete
+                $currentItemIds = array_column($currentItems, 'id');
+                $newItemIds = array_filter(array_column($itemsToUpdate, 'assignment_item_id'), function($id) { return $id > 0; });
+
+                // Delete items that are no longer in the list
+                $itemsToDelete = array_diff($currentItemIds, $newItemIds);
+                foreach ($itemsToDelete as $itemIdToDelete) {
+                    // Get item details before deletion for stock update
+                    $stmt = $conn->prepare("SELECT inventory_id, quantity FROM assignment_items WHERE id = ?");
+                    $stmt->bind_param("i", $itemIdToDelete);
+                    $stmt->execute();
+                    $result = $stmt->get_result();
+                    $deletedItem = $result->fetch_assoc();
+                    $stmt->close();
+
+                    // Delete the assignment item
+                    $stmt = $conn->prepare("DELETE FROM assignment_items WHERE id = ?");
+                    $stmt->bind_param("i", $itemIdToDelete);
+                    $stmt->execute();
+                    $stmt->close();
+
+                    // Update inventory stock
+                    if (!updateInventoryStock($deletedItem['inventory_id'])) {
+                        throw new Exception('Error updating inventory stock for item ID ' . $deletedItem['inventory_id'] . '.');
+                    }
+                }
+
+                // Update or insert items
+                $inventoryIdsToUpdate = [];
+                foreach ($itemsToUpdate as $item) {
+                    $assignmentItemId = $item['assignment_item_id'];
+                    $inventoryId = $item['inventory_id'];
+                    $quantity = $item['quantity'];
+                    $conditionOnAssignment = $item['condition'];
+
+                    // Get old inventory_id if updating
+                    $oldInventoryId = null;
+                    if ($assignmentItemId > 0) {
+                        foreach ($currentItems as $currentItem) {
+                            if ($currentItem['id'] == $assignmentItemId) {
+                                $oldInventoryId = $currentItem['inventory_id'];
+                                break;
+                            }
+                        }
+                    }
+
+                    if ($assignmentItemId > 0) {
+                        // Update existing item
+                        $stmt = $conn->prepare("UPDATE assignment_items SET inventory_id = ?, quantity = ?, condition_on_assignment = ? WHERE id = ?");
+                        $stmt->bind_param("iisi", $inventoryId, $quantity, $conditionOnAssignment, $assignmentItemId);
+                        $stmt->execute();
+                        $stmt->close();
+                        
+                        // If inventory_id changed, we need to update stock for old inventory too
+                        if ($oldInventoryId && $oldInventoryId != $inventoryId) {
+                            if (!in_array($oldInventoryId, $inventoryIdsToUpdate)) {
+                                $inventoryIdsToUpdate[] = $oldInventoryId;
+                            }
+                        }
+                    } else {
+                        // Insert new item
+                        $stmt = $conn->prepare("INSERT INTO assignment_items (assignment_id, inventory_id, quantity, condition_on_assignment) VALUES (?, ?, ?, ?)");
+                        $stmt->bind_param("iiis", $assignmentId, $inventoryId, $quantity, $conditionOnAssignment);
+                        $stmt->execute();
+                        $stmt->close();
+                    }
+
+                    // Track inventory IDs for stock update
+                    if (!in_array($inventoryId, $inventoryIdsToUpdate)) {
+                        $inventoryIdsToUpdate[] = $inventoryId;
+                    }
+                }
+                
+                // Update inventory stock for all affected items
+                foreach ($inventoryIdsToUpdate as $invId) {
+                    if (!updateInventoryStock($invId)) {
+                        throw new Exception('Error updating inventory stock for item ID ' . $invId . '.');
+                    }
+                }
+
+                // Commit transaction
+                $conn->commit();
+                
+                logAudit('update', 'assignments', $assignmentId, null, ['employee_id' => $employeeId, 'assigned_date' => $assignedDate]);
+                
+                $message = 'Assignment updated successfully.';
+                $messageType = 'success';
+            } catch (Exception $e) {
+                $conn->rollback();
+                $message = $e->getMessage();
+                $messageType = 'danger';
+            }
+        }
     } elseif ($action === 'return') {
         $assignmentId = intval($_POST['assignment_id'] ?? 0);
         $returnDate = sanitizeInput($_POST['return_date'] ?? date('Y-m-d'));
@@ -556,17 +770,47 @@ $departments = $conn->query("SELECT DISTINCT department FROM employees WHERE sta
 // Get inventory items for assignment
 $inventoryItems = $conn->query("SELECT id, item_name, available_quantity FROM inventory WHERE status != 'retired' ORDER BY item_name")->fetch_all(MYSQLI_ASSOC);
 
-// Get assignments (grouped by assignment, not by item)
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
+// Get total count for pagination
+$countQuery = "SELECT COUNT(*) as total
+          FROM assignments a
+          INNER JOIN employees e ON a.employee_id = e.id
+          INNER JOIN users u ON a.assigned_by = u.id
+          WHERE $whereClause";
+$countStmt = $conn->prepare($countQuery);
+if (!empty($params)) {
+    $countStmt->bind_param($types, ...$params);
+}
+$countStmt->execute();
+$countResult = $countStmt->get_result();
+$totalAssignments = $countResult->fetch_assoc()['total'];
+$countStmt->close();
+$totalPages = max(1, ceil($totalAssignments / $limit));
+
+// Get assignments (grouped by assignment, not by item) with pagination
 $query = "SELECT a.*, e.id as employee_db_id, e.employee_id, e.full_name as employee_name, u.full_name as assigned_by_name
           FROM assignments a
           INNER JOIN employees e ON a.employee_id = e.id
           INNER JOIN users u ON a.assigned_by = u.id
           WHERE $whereClause
-          ORDER BY a.created_at DESC";
+          ORDER BY a.created_at DESC
+          LIMIT ? OFFSET ?";
 $stmt = $conn->prepare($query);
 
+$limitParam = $limit;
+$offsetParam = $offset;
 if (!empty($params)) {
+    $types .= "ii";
+    $params[] = $limitParam;
+    $params[] = $offsetParam;
     $stmt->bind_param($types, ...$params);
+} else {
+    $stmt->bind_param("ii", $limitParam, $offsetParam);
 }
 
 $stmt->execute();
@@ -761,6 +1005,9 @@ if ($message) {
                                         <i class="bi bi-info-circle"></i> Details
                                     </button>
                                     <?php if ($assign['status'] === 'active'): ?>
+                                        <button type="button" class="btn btn-sm btn-primary" onclick="editAssignment(<?php echo $assign['id']; ?>)" title="Edit Assignment">
+                                            <i class="bi bi-pencil"></i> Edit
+                                        </button>
                                         <button type="button" class="btn btn-sm btn-success" onclick="returnItem(<?php echo $assign['id']; ?>)" title="Return Items">
                                             <i class="bi bi-arrow-return-left"></i> Return
                                         </button>
@@ -790,6 +1037,24 @@ if ($message) {
                 </tbody>
             </table>
         </div>
+        <?php if ($totalPages > 1): ?>
+            <div class="card-footer">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <small class="text-muted">
+                            Showing <?php echo count($assignments); ?> of <?php echo $totalAssignments; ?> assignments (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                        </small>
+                    </div>
+                    <?php 
+                    echo renderPagination($page, $totalPages, 'assignments.php', [
+                        'search' => $search,
+                        'status' => $statusFilter,
+                        'employee' => $employeeFilter > 0 ? $employeeFilter : ''
+                    ]);
+                    ?>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 
@@ -903,6 +1168,93 @@ if ($message) {
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                     <button type="submit" class="btn btn-primary">Assign Items</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Assignment Modal -->
+<div class="modal fade" id="editAssignmentModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Edit Assignment</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" id="editAssignmentForm">
+                <div class="modal-body">
+                    <input type="hidden" name="action" value="edit">
+                    <input type="hidden" name="assignment_id" id="editAssignmentId">
+
+                    <div class="mb-3">
+                        <label class="form-label">Department</label>
+                        <select class="form-select" id="editDepartmentFilter" onchange="filterEmployeesByDepartmentForEdit()">
+                            <option value="">All Departments</option>
+                            <?php foreach ($departments as $dept): ?>
+                                <option value="<?php echo htmlspecialchars($dept['department']); ?>">
+                                    <?php echo htmlspecialchars($dept['department']); ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Employee <span class="text-danger">*</span></label>
+                        <select class="form-select" name="employee_id" id="editEmployeeSelect" required>
+                            <option value="">Select Department First</option>
+                        </select>
+                        <small class="form-text text-muted"><i class="bi bi-info-circle"></i> Select a department above to view employees</small>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Assigned Date <span class="text-danger">*</span></label>
+                            <input type="date" class="form-control" name="assigned_date" id="editAssignedDate" required>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Expected Return Date</label>
+                            <input type="date" class="form-control" name="expected_return_date" id="editExpectedReturnDate">
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Items <span class="text-danger">*</span></label>
+                        <div class="table-responsive">
+                            <table class="table table-sm align-middle" id="editAssignmentItemsTable">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 40%;">Item</th>
+                                        <th style="width: 15%;">Available</th>
+                                        <th style="width: 15%;">Quantity</th>
+                                        <th style="width: 20%;">Condition</th>
+                                        <th style="width: 10%;"></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="editAssignmentItemsBody">
+                                    <!-- Items will be populated by JavaScript -->
+                                </tbody>
+                            </table>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-primary mt-2" onclick="addEditItemRow()">
+                            <i class="bi bi-plus-circle"></i> Add Another Item
+                        </button>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Notes</label>
+                        <textarea class="form-control" name="notes" id="editNotes" rows="3"></textarea>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Password (Optional)</label>
+                        <input type="text" class="form-control" name="password" id="editPassword" placeholder="Enter password if applicable">
+                        <small class="form-text text-muted">Optional: Add password for devices or accounts if needed</small>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Update Assignment</button>
                 </div>
             </form>
         </div>
@@ -1033,6 +1385,8 @@ if ($message) {
 <script>
 // Store all employees data
 const allEmployees = <?php echo json_encode($allEmployees); ?>;
+// Store all inventory items for edit modal
+const allInventoryItems = <?php echo json_encode($inventoryItems); ?>;
 
 // Filter employees by department
 function filterEmployeesByDepartment() {
@@ -1191,6 +1545,298 @@ function validateItemRow(inputEl) {
         inputEl.setCustomValidity('');
         inputEl.classList.remove('is-invalid');
     }
+}
+
+// Edit Assignment Functions
+function editAssignment(assignmentId) {
+    // Show loading state
+    document.getElementById('editAssignmentItemsBody').innerHTML = '<tr><td colspan="5" class="text-center"><div class="spinner-border spinner-border-sm"></div> Loading...</td></tr>';
+    
+    // Open modal
+    const modal = new bootstrap.Modal(document.getElementById('editAssignmentModal'));
+    modal.show();
+    
+    // Fetch assignment data
+    fetch(`ajax/get_assignment_items.php?assignment_id=${assignmentId}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                alert('Error loading assignment: ' + data.error);
+                modal.hide();
+                return;
+            }
+            
+            const assignment = data.assignment;
+            const items = data.items || [];
+            
+            // Populate assignment fields
+            document.getElementById('editAssignmentId').value = assignment.id;
+            document.getElementById('editAssignedDate').value = assignment.assigned_date;
+            document.getElementById('editExpectedReturnDate').value = assignment.expected_return_date || '';
+            document.getElementById('editNotes').value = assignment.notes || '';
+            document.getElementById('editPassword').value = assignment.password || '';
+            
+            // Set department and employee
+            if (assignment.department) {
+                document.getElementById('editDepartmentFilter').value = assignment.department;
+                filterEmployeesByDepartmentForEdit();
+                // Wait a bit for employee dropdown to populate
+                setTimeout(() => {
+                    document.getElementById('editEmployeeSelect').value = assignment.employee_id;
+                }, 100);
+            }
+            
+            // Populate items
+            populateEditItemsTable(items);
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Error loading assignment data. Please try again.');
+            modal.hide();
+        });
+}
+
+function populateEditItemsTable(items) {
+    const tbody = document.getElementById('editAssignmentItemsBody');
+    tbody.innerHTML = '';
+    
+    if (items.length === 0) {
+        // Add one empty row if no items
+        addEditItemRow();
+        return;
+    }
+    
+    items.forEach((item, index) => {
+        const row = createEditItemRow(item);
+        tbody.appendChild(row);
+    });
+}
+
+function createEditItemRow(item = null) {
+    const row = document.createElement('tr');
+    row.className = 'assignment-item-row';
+    
+    const itemId = item ? item.id : 0; // assignment_item_id
+    const inventoryId = item ? item.inventory_id : 0;
+    const quantity = item ? item.quantity : 1;
+    const condition = item ? item.condition_on_assignment : 'good';
+    
+    // For existing items, use available_for_edit from the API response
+    // For new items, use the current available_quantity
+    let availableForEdit = 0;
+    if (item) {
+        availableForEdit = item.available_for_edit || (item.available_quantity + quantity);
+    } else {
+        // For new items, find from allInventoryItems
+        const invItem = allInventoryItems.find(i => i.id == inventoryId);
+        availableForEdit = invItem ? invItem.available_quantity : 0;
+    }
+    
+    // Store original values for available stock calculation
+    row.dataset.originalInventoryId = inventoryId;
+    row.dataset.originalQuantity = quantity;
+    
+    row.innerHTML = `
+        <td>
+            <input type="hidden" name="assignment_item_id[]" value="${itemId}">
+            <select class="form-select inventory-select" name="inventory_id[]" onchange="updateEditItemRow(this)" required>
+                <option value="">Select Item</option>
+                ${allInventoryItems.map(inv => {
+                    const selected = inv.id == inventoryId ? 'selected' : '';
+                    // For the selected item, use availableForEdit; for others, use their available_quantity
+                    const displayAvailable = inv.id == inventoryId ? availableForEdit : inv.available_quantity;
+                    return `<option value="${inv.id}" data-available="${displayAvailable}" ${selected}>
+                        ${inv.item_name} (Available: ${displayAvailable})
+                    </option>`;
+                }).join('')}
+            </select>
+        </td>
+        <td>
+            <span class="badge bg-${availableForEdit > 0 ? 'success' : 'danger'} available-stock" data-available="${availableForEdit}">
+                ${availableForEdit > 0 ? availableForEdit : '-'}
+            </span>
+        </td>
+        <td>
+            <input type="number" class="form-control quantity-input" name="quantity[]" min="1" value="${quantity}" onchange="validateEditItemRow(this)" required>
+        </td>
+        <td>
+            <select class="form-select" name="condition_on_assignment[]">
+                <option value="excellent" ${condition === 'excellent' ? 'selected' : ''}>Excellent</option>
+                <option value="good" ${condition === 'good' ? 'selected' : ''}>Good</option>
+                <option value="fair" ${condition === 'fair' ? 'selected' : ''}>Fair</option>
+                <option value="poor" ${condition === 'poor' ? 'selected' : ''}>Poor</option>
+            </select>
+        </td>
+        <td class="text-center">
+            <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeEditItemRow(this)">
+                <i class="bi bi-x"></i>
+            </button>
+        </td>
+    `;
+    
+    return row;
+}
+
+function addEditItemRow() {
+    const tbody = document.getElementById('editAssignmentItemsBody');
+    const newRow = createEditItemRow();
+    tbody.appendChild(newRow);
+}
+
+function removeEditItemRow(button) {
+    const row = button.closest('.assignment-item-row');
+    const tbody = document.getElementById('editAssignmentItemsBody');
+    if (tbody.querySelectorAll('.assignment-item-row').length > 1) {
+        row.remove();
+    } else {
+        // Reset instead of removing last row
+        const select = row.querySelector('.inventory-select');
+        const availableSpan = row.querySelector('.available-stock');
+        const quantityInput = row.querySelector('.quantity-input');
+        const itemIdInput = row.querySelector('input[name="assignment_item_id[]"]');
+        if (select) select.value = '';
+        if (itemIdInput) itemIdInput.value = '0';
+        if (availableSpan) {
+            availableSpan.textContent = '-';
+            availableSpan.dataset.available = '0';
+            availableSpan.className = 'badge bg-secondary available-stock';
+        }
+        if (quantityInput) {
+            quantityInput.value = 1;
+            quantityInput.setCustomValidity('');
+            quantityInput.classList.remove('is-invalid');
+        }
+    }
+}
+
+function updateEditItemRow(selectEl) {
+    const row = selectEl.closest('.assignment-item-row');
+    const option = selectEl.options[selectEl.selectedIndex];
+    const availableSpan = row.querySelector('.available-stock');
+    const quantityInput = row.querySelector('.quantity-input');
+    const itemIdInput = row.querySelector('input[name="assignment_item_id[]"]');
+    
+    if (!option || !option.value) {
+        if (availableSpan) {
+            availableSpan.textContent = '-';
+            availableSpan.dataset.available = '0';
+            availableSpan.className = 'badge bg-secondary available-stock';
+        }
+        return;
+    }
+    
+    const selectedInventoryId = parseInt(option.value);
+    const currentItemId = parseInt(itemIdInput ? itemIdInput.value : 0);
+    
+    // Find the inventory item to get its available stock
+    const invItem = allInventoryItems.find(i => i.id == selectedInventoryId);
+    if (!invItem) {
+        if (availableSpan) {
+            availableSpan.textContent = '-';
+            availableSpan.dataset.available = '0';
+            availableSpan.className = 'badge bg-danger available-stock';
+        }
+        return;
+    }
+    
+    // Get the original item data if this is an existing assignment item
+    // We need to check if this row was originally for a different inventory item
+    const originalInventoryId = row.dataset.originalInventoryId ? parseInt(row.dataset.originalInventoryId) : null;
+    const originalQuantity = row.dataset.originalQuantity ? parseInt(row.dataset.originalQuantity) : 0;
+    
+    // Calculate available stock
+    // If this is the same inventory item as originally assigned, add back the original quantity
+    let available = invItem.available_quantity;
+    if (originalInventoryId === selectedInventoryId && currentItemId > 0 && originalQuantity > 0) {
+        available = invItem.available_quantity + originalQuantity;
+    }
+    
+    // Update the data attribute on the option
+    option.setAttribute('data-available', available);
+    
+    if (availableSpan) {
+        availableSpan.textContent = available > 0 ? available : '-';
+        availableSpan.dataset.available = available;
+        availableSpan.className = 'badge bg-' + (available > 0 ? 'success' : 'danger') + ' available-stock';
+    }
+    
+    // If changing to a different inventory item and we had an existing assignment item,
+    // we might want to reset the assignment_item_id, but let's keep it and let backend handle it
+    // The backend will create a new item if inventory_id changes
+
+    if (quantityInput) {
+        validateEditItemRow(quantityInput);
+    }
+}
+
+function validateEditItemRow(inputEl) {
+    const row = inputEl.closest('.assignment-item-row');
+    const selectEl = row.querySelector('.inventory-select');
+    const option = selectEl ? selectEl.options[selectEl.selectedIndex] : null;
+    const available = option ? parseInt(option.getAttribute('data-available') || 0) : 0;
+    const quantity = parseInt(inputEl.value || 0);
+
+    if (!option || !option.value) {
+        inputEl.setCustomValidity('Please select an item first.');
+        inputEl.classList.add('is-invalid');
+        return;
+    }
+
+    if (quantity <= 0) {
+        inputEl.setCustomValidity('Quantity must be at least 1.');
+        inputEl.classList.add('is-invalid');
+    } else if (quantity > available) {
+        inputEl.setCustomValidity('Quantity cannot exceed available stock (' + available + ').');
+        inputEl.classList.add('is-invalid');
+    } else {
+        inputEl.setCustomValidity('');
+        inputEl.classList.remove('is-invalid');
+    }
+}
+
+function filterEmployeesByDepartmentForEdit() {
+    const departmentSelect = document.getElementById('editDepartmentFilter');
+    const employeeSelect = document.getElementById('editEmployeeSelect');
+    const selectedDepartment = departmentSelect.value;
+    
+    // Clear current options
+    employeeSelect.innerHTML = '';
+    
+    // Filter employees
+    let filteredEmployees;
+    if (!selectedDepartment || selectedDepartment === '') {
+        filteredEmployees = allEmployees;
+    } else {
+        filteredEmployees = allEmployees.filter(emp => emp.department === selectedDepartment);
+    }
+    
+    if (filteredEmployees.length === 0) {
+        employeeSelect.innerHTML = '<option value="">No employees found</option>';
+        employeeSelect.disabled = true;
+        employeeSelect.required = false;
+        return;
+    }
+    
+    // Add default option
+    employeeSelect.innerHTML = '<option value="">Select Employee</option>';
+    
+    // Sort employees by name
+    filteredEmployees.sort((a, b) => {
+        if (a.full_name < b.full_name) return -1;
+        if (a.full_name > b.full_name) return 1;
+        return 0;
+    });
+    
+    // Populate employee dropdown
+    filteredEmployees.forEach(emp => {
+        const option = document.createElement('option');
+        option.value = emp.id;
+        option.textContent = emp.full_name + ' (' + emp.employee_id + ')';
+        employeeSelect.appendChild(option);
+    });
+    
+    employeeSelect.disabled = false;
+    employeeSelect.required = true;
 }
 
 function returnItem(assignmentId) {

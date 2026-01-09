@@ -135,7 +135,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // Get users
-$users = $conn->query("SELECT * FROM users ORDER BY created_at DESC")->fetch_all(MYSQLI_ASSOC);
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
+// Get total count for pagination
+$totalUsers = $conn->query("SELECT COUNT(*) as total FROM users")->fetch_assoc()['total'];
+$totalPages = max(1, ceil($totalUsers / $limit));
+
+// Get users with pagination
+$users = $conn->query("SELECT * FROM users ORDER BY created_at DESC LIMIT $limit OFFSET $offset")->fetch_all(MYSQLI_ASSOC);
 ?>
 
 <div class="row mb-4">
@@ -205,6 +216,18 @@ if ($message) {
                 </tbody>
             </table>
         </div>
+        <?php if ($totalPages > 1): ?>
+            <div class="card-footer">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <small class="text-muted">
+                            Showing <?php echo count($users); ?> of <?php echo $totalUsers; ?> users (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                        </small>
+                    </div>
+                    <?php echo renderPagination($page, $totalPages, 'users.php'); ?>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 

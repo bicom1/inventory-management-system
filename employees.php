@@ -245,15 +245,40 @@ if (!empty($statusFilter)) {
 
 $whereClause = implode(" AND ", $where);
 
+// Get pagination parameters
+$pagination = getPaginationParams(10);
+$page = $pagination['page'];
+$offset = $pagination['offset'];
+$limit = $pagination['limit'];
+
+// Get total count for pagination
+$countQuery = "SELECT COUNT(*) as total FROM employees WHERE $whereClause";
+$countStmt = $conn->prepare($countQuery);
+if (!empty($params)) {
+    $countStmt->bind_param($types, ...$params);
+}
+$countStmt->execute();
+$countResult = $countStmt->get_result();
+$totalEmployees = $countResult->fetch_assoc()['total'];
+$countStmt->close();
+$totalPages = max(1, ceil($totalEmployees / $limit));
+
 // Get unique departments
 $departments = $conn->query("SELECT DISTINCT department FROM employees WHERE department IS NOT NULL AND department != '' ORDER BY department")->fetch_all(MYSQLI_ASSOC);
 
-// Get employees
-$query = "SELECT * FROM employees WHERE $whereClause ORDER BY created_at DESC";
+// Get employees with pagination
+$query = "SELECT * FROM employees WHERE $whereClause ORDER BY created_at DESC LIMIT ? OFFSET ?";
 $stmt = $conn->prepare($query);
 
+$limitParam = $limit;
+$offsetParam = $offset;
 if (!empty($params)) {
+    $types .= "ii";
+    $params[] = $limitParam;
+    $params[] = $offsetParam;
     $stmt->bind_param($types, ...$params);
+} else {
+    $stmt->bind_param("ii", $limitParam, $offsetParam);
 }
 
 $stmt->execute();
@@ -364,6 +389,24 @@ if ($message) {
                 </tbody>
             </table>
         </div>
+        <?php if ($totalPages > 1): ?>
+            <div class="card-footer">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <small class="text-muted">
+                            Showing <?php echo count($employees); ?> of <?php echo $totalEmployees; ?> employees (Page <?php echo $page; ?> of <?php echo $totalPages; ?>)
+                        </small>
+                    </div>
+                    <?php 
+                    echo renderPagination($page, $totalPages, 'employees.php', [
+                        'search' => $search,
+                        'department' => $departmentFilter,
+                        'status' => $statusFilter
+                    ]);
+                    ?>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 
